@@ -1,0 +1,16 @@
+# training data (download yourself, see README)
+input.txt
+
+# checkpoints / weights
+*.npz
+*.safetensors
+*.gguf
+checkpoints/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+
+# os
+.DS_Store
