@@ -21,17 +21,25 @@ python minigpt_mlx.py --tokenizer bpe --vocab_size 2048
 
 ### Architecture
 
-The defaults are a GPT-2-style baseline. Three flags modernize it toward Llama, and can be toggled one at a time to measure each effect:
+The defaults are a Llama-like stack (RMSNorm + RoPE + SwiGLU). Each piece can be flipped back to the GPT-2-style baseline to measure its effect:
+
+| Flag | modern (default) → baseline | what it is |
+| --- | --- | --- |
+| `--norm` | `rmsnorm` → `layernorm` | cheaper normalization (no mean/bias) |
+| `--pos` | `rope` → `learned` | rotary position encoding inside attention |
+| `--mlp` | `swiglu` → `gelu` | gated feed-forward (hidden width kept param-matched) |
+
+### Scaled training
+
+A ~27M-param run on the Kafka corpus (safe on 16GB; ~4GB peak):
 
 ```bash
-python minigpt_mlx.py --norm rmsnorm --pos rope --mlp swiglu   # Llama-like
+python minigpt_mlx.py --tokenizer bpe --vocab_size 2048 \
+  --n_layer 8 --n_head 8 --n_embd 512 --block_size 256 --batch_size 32 \
+  --max_iters 10000 --eval_interval 250
 ```
 
-| Flag | baseline → modern | effect |
-| --- | --- | --- |
-| `--norm` | `layernorm` → `rmsnorm` | cheaper normalization (no mean/bias) |
-| `--pos` | `learned` → `rope` | rotary position encoding inside attention |
-| `--mlp` | `gelu` → `swiglu` | gated feed-forward (hidden width kept param-matched) |
+Writes a checkpoint (`model.safetensors` + `config.json` + `tokenizer.json`), a `loss_curve.png`, and a `report_card.md` to `--out_dir` (default `out/`).
 
 ### Dataset
 

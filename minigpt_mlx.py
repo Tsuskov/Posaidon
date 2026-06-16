@@ -15,7 +15,9 @@ Run:  python minigpt_mlx.py
 """
 
 import argparse
+import json
 import math
+import os
 import time
 
 import mlx.core as mx
@@ -37,16 +39,19 @@ def get_args():
     p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4)
     p.add_argument("--n_embd", type=int, default=128)
-    # Phase 4 — modernize toward Llama (defaults reproduce the GPT-2-style baseline)
-    p.add_argument("--norm", choices=["layernorm", "rmsnorm"], default="layernorm")
-    p.add_argument("--pos", choices=["learned", "rope"], default="learned",
+    # Architecture — defaults are the Llama-like stack (Phase 4). Flip any one
+    # back to the GPT-2-style baseline with --norm layernorm / --pos learned / --mlp gelu.
+    p.add_argument("--norm", choices=["layernorm", "rmsnorm"], default="rmsnorm")
+    p.add_argument("--pos", choices=["learned", "rope"], default="rope",
                    help="learned position embeddings vs rotary (RoPE)")
-    p.add_argument("--mlp", choices=["gelu", "swiglu"], default="gelu")
+    p.add_argument("--mlp", choices=["gelu", "swiglu"], default="swiglu")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--max_iters", type=int, default=2000)
     p.add_argument("--eval_interval", type=int, default=250)
     p.add_argument("--learning_rate", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument("--out_dir", default="out",
+                   help="where to write checkpoints, loss curve and report card")
     return p.parse_args()
 
 
@@ -183,7 +188,7 @@ class GPT(nn.Module):
 #         ("ung", "der", " Kommandant") become single ids -> fewer tokens,
 #         so a fixed block_size covers far more text.
 # ----------------------------------------------------------------------------
-def build_tokenizer(text, kind, vocab_size):
+def build_tokenizer(text, kind, vocab_size, out_dir=None):
     if kind == "char":
         chars = sorted(set(text))
         stoi = {c: i for i, c in enumerate(chars)}
@@ -198,9 +203,61 @@ def build_tokenizer(text, kind, vocab_size):
     tok.decoder = decoders.ByteLevel()
     trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=["<unk>"])
     tok.train_from_iterator([text], trainer)  # learn merges from our corpus
+    if out_dir is not None:
+        tok.save(os.path.join(out_dir, "tokenizer.json"))  # so we can decode later
     encode = lambda s: tok.encode(s).ids
     decode = lambda ids: tok.decode(ids)
     return encode, decode, tok.get_vocab_size()
+
+
+# ----------------------------------------------------------------------------
+# Phase 5 — checkpoints, loss curve, report card.
+# ----------------------------------------------------------------------------
+def save_checkpoint(model, cfg, vocab_size, out_dir):
+    """Save weights + the config needed to rebuild and reload the model."""
+    model.save_weights(os.path.join(out_dir, "model.safetensors"))
+    meta = {**vars(cfg), "vocab_size": vocab_size}
+    with open(os.path.join(out_dir, "config.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def plot_losses(history, out_dir):
+    import matplotlib
+    matplotlib.use("Agg")  # no display needed, just write a file
+    import matplotlib.pyplot as plt
+
+    its = [h[0] for h in history]
+    plt.figure(figsize=(8, 5))
+    plt.plot(its, [h[1] for h in history], label="train")
+    plt.plot(its, [h[2] for h in history], label="val")
+    plt.xlabel("iteration"); plt.ylabel("cross-entropy loss")
+    plt.title("Posaidon training"); plt.legend(); plt.grid(alpha=0.3)
+    path = os.path.join(out_dir, "loss_curve.png")
+    plt.savefig(path, dpi=120, bbox_inches="tight")
+    return path
+
+
+def write_report(out_dir, cfg, vocab_size, n_params, history, peak_gb,
+                 toks_per_s, elapsed, chars_per_tok, sample):
+    """A nanochat-style report card: config + numbers + a sample."""
+    best_val = min(h[2] for h in history)
+    lines = [
+        "# Posaidon — report card", "",
+        f"- **architecture**: norm={cfg.norm}, pos={cfg.pos}, mlp={cfg.mlp} (Llama-like)",
+        f"- **size**: {n_params/1e6:.1f}M params "
+        f"(n_layer={cfg.n_layer}, n_head={cfg.n_head}, n_embd={cfg.n_embd})",
+        f"- **tokenizer**: {cfg.tokenizer}, vocab={vocab_size} "
+        f"({chars_per_tok:.2f} chars/token, block_size={cfg.block_size})",
+        f"- **training**: {cfg.max_iters:,} iters, batch={cfg.batch_size}, "
+        f"lr={cfg.learning_rate}, {elapsed/60:.1f} min",
+        f"- **hardware**: {peak_gb:.2f} GB peak, {toks_per_s:,.0f} tokens/s",
+        f"- **loss**: final train {history[-1][1]:.4f} / val {history[-1][2]:.4f}, "
+        f"best val {best_val:.4f}", "",
+        "![loss curve](loss_curve.png)", "",
+        "## sample", "", "```", sample, "```", "",
+    ]
+    with open(os.path.join(out_dir, "report_card.md"), "w") as f:
+        f.write("\n".join(lines))
 
 
 # ----------------------------------------------------------------------------
@@ -209,10 +266,12 @@ def build_tokenizer(text, kind, vocab_size):
 def main():
     cfg = get_args()
     mx.random.seed(cfg.seed)
+    os.makedirs(cfg.out_dir, exist_ok=True)
 
     with open(cfg.data, "r", encoding="utf-8") as f:
         text = f.read()
-    encode, decode, vocab_size = build_tokenizer(text, cfg.tokenizer, cfg.vocab_size)
+    encode, decode, vocab_size = build_tokenizer(
+        text, cfg.tokenizer, cfg.vocab_size, cfg.out_dir)
 
     data = mx.array(encode(text))
     n = int(0.9 * len(data))
@@ -249,20 +308,35 @@ def main():
     optimizer = optim.AdamW(learning_rate=cfg.learning_rate)
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
+    history = []  # (iter, train_loss, val_loss) for the loss curve
+    mx.reset_peak_memory()
     t0 = time.time()
     for it in range(cfg.max_iters + 1):
         if it % cfg.eval_interval == 0:
             tr, va = eval_loss("train"), eval_loss("val")
+            history.append((it, tr, va))
             print(f"iter {it:5d} | train {tr:.4f} | val {va:.4f} | {time.time()-t0:.1f}s")
+            save_checkpoint(model, cfg, vocab_size, cfg.out_dir)  # crash-safe
         x, y = get_batch("train")
         loss, grads = loss_and_grad(model, x, y)
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state)
 
+    elapsed = time.time() - t0
+    toks_per_s = cfg.max_iters * cfg.batch_size * cfg.block_size / elapsed
+    peak_gb = mx.get_peak_memory() / 1e9
+    save_checkpoint(model, cfg, vocab_size, cfg.out_dir)
+    print(f"peak memory: {peak_gb:.2f} GB  |  throughput: {toks_per_s:,.0f} tokens/s")
+
     print("\n--- sample ---")
     start = mx.array([encode("\n")])
-    out = model.generate(start, max_new_tokens=300)[0].tolist()
-    print(decode(out))
+    sample = decode(model.generate(start, max_new_tokens=300)[0].tolist())
+    print(sample)
+
+    plot_losses(history, cfg.out_dir)
+    write_report(cfg.out_dir, cfg, vocab_size, n_params, history, peak_gb,
+                 toks_per_s, elapsed, chars_per_tok, sample)
+    print(f"\nwrote checkpoint, loss_curve.png and report_card.md to {cfg.out_dir}/")
 
 
 if __name__ == "__main__":

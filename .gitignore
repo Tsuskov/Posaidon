@@ -1,11 +1,12 @@
 # training data (download yourself, see README)
 input.txt
 
-# checkpoints / weights
+# checkpoints / weights / training artifacts
 *.npz
 *.safetensors
 *.gguf
 checkpoints/
+out/
 
 # python
 .venv/
