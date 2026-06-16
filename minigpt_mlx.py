@@ -29,7 +29,11 @@ import mlx.optimizers as optim
 def get_args():
     p = argparse.ArgumentParser(description="tiny char-level GPT in MLX")
     p.add_argument("--data", default="input.txt")
-    p.add_argument("--block_size", type=int, default=64, help="context length")
+    p.add_argument("--tokenizer", choices=["char", "bpe"], default="char",
+                   help="char = one token per character; bpe = learned subwords")
+    p.add_argument("--vocab_size", type=int, default=2048,
+                   help="target vocab for the bpe tokenizer (ignored for char)")
+    p.add_argument("--block_size", type=int, default=64, help="context length (in tokens)")
     p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4)
     p.add_argument("--n_embd", type=int, default=128)
@@ -132,6 +136,33 @@ class GPT(nn.Module):
 
 
 # ----------------------------------------------------------------------------
+# Tokenizer — turn text into a sequence of integer ids (and back).
+#   char: one id per character (the Phase 0-2 toy).
+#   bpe:  byte-level BPE learned from the corpus, so common letter sequences
+#         ("ung", "der", " Kommandant") become single ids -> fewer tokens,
+#         so a fixed block_size covers far more text.
+# ----------------------------------------------------------------------------
+def build_tokenizer(text, kind, vocab_size):
+    if kind == "char":
+        chars = sorted(set(text))
+        stoi = {c: i for i, c in enumerate(chars)}
+        itos = {i: c for i, c in enumerate(chars)}
+        encode = lambda s: [stoi[c] for c in s]
+        decode = lambda ids: "".join(itos[i] for i in ids)
+        return encode, decode, len(chars)
+
+    from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+    tok = Tokenizer(models.BPE(unk_token="<unk>"))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)  # any UTF-8
+    tok.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=["<unk>"])
+    tok.train_from_iterator([text], trainer)  # learn merges from our corpus
+    encode = lambda s: tok.encode(s).ids
+    decode = lambda ids: tok.decode(ids)
+    return encode, decode, tok.get_vocab_size()
+
+
+# ----------------------------------------------------------------------------
 # 5. Data + training loop
 # ----------------------------------------------------------------------------
 def main():
@@ -140,17 +171,18 @@ def main():
 
     with open(cfg.data, "r", encoding="utf-8") as f:
         text = f.read()
-    chars = sorted(set(text))
-    vocab_size = len(chars)
-    stoi = {c: i for i, c in enumerate(chars)}
-    itos = {i: c for i, c in enumerate(chars)}
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: "".join(itos[i] for i in l)
+    encode, decode, vocab_size = build_tokenizer(text, cfg.tokenizer, cfg.vocab_size)
 
     data = mx.array(encode(text))
     n = int(0.9 * len(data))
     train_data, val_data = data[:n], data[n:]
-    print(f"vocab_size={vocab_size}  train={len(train_data)}  val={len(val_data)}")
+    chars_per_tok = len(text) / len(data)
+    print(f"tokenizer={cfg.tokenizer}  vocab_size={vocab_size}  "
+          f"{len(text):,d} chars -> {len(data):,d} tokens  "
+          f"({chars_per_tok:.2f} chars/token)")
+    print(f"block_size={cfg.block_size} tokens  =>  ~{cfg.block_size * chars_per_tok:.0f} "
+          f"chars of context per window")
+    print(f"train={len(train_data)}  val={len(val_data)}")
 
     def get_batch(split):
         d = train_data if split == "train" else val_data
@@ -187,8 +219,8 @@ def main():
         mx.eval(model.parameters(), optimizer.state)
 
     print("\n--- sample ---")
-    start = mx.array([[stoi["\n"]]])
-    out = model.generate(start, max_new_tokens=500)[0].tolist()
+    start = mx.array([encode("\n")])
+    out = model.generate(start, max_new_tokens=300)[0].tolist()
     print(decode(out))
 
 
