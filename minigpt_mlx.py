@@ -49,6 +49,13 @@ def get_args():
     p.add_argument("--max_iters", type=int, default=2000)
     p.add_argument("--eval_interval", type=int, default=250)
     p.add_argument("--learning_rate", type=float, default=3e-4)
+    # Regularization (Phase 5) — fight overfitting on a small corpus. Defaults
+    # are off so existing runs reproduce; pass e.g. --dropout 0.1 --weight_decay 0.1.
+    p.add_argument("--dropout", type=float, default=0.0,
+                   help="dropout prob on attention weights, residuals and embeddings")
+    p.add_argument("--weight_decay", type=float, default=0.0, help="AdamW weight decay")
+    p.add_argument("--early_stop_patience", type=int, default=0,
+                   help="stop if val loss hasn't improved for this many evals (0 = off)")
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--out_dir", default="out",
                    help="where to write checkpoints, loss curve and report card")
@@ -77,6 +84,8 @@ class CausalSelfAttention(nn.Module):
         self.n_head = cfg.n_head
         self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)  # q, k, v in one matmul
         self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
+        self.attn_dropout = nn.Dropout(cfg.dropout)    # on the softmax weights
+        self.resid_dropout = nn.Dropout(cfg.dropout)   # on the residual output
         head_size = cfg.n_embd // cfg.n_head
         # RoPE rotates q/k by position instead of adding a position embedding.
         self.rope = nn.RoPE(head_size, base=10000) if cfg.pos == "rope" else None
@@ -97,10 +106,11 @@ class CausalSelfAttention(nn.Module):
         att = (q @ k.transpose(0, 1, 3, 2)) * (1.0 / math.sqrt(hs))  # (B, nh, T, T)
         mask = mx.triu(mx.full((T, T), -mx.inf), k=1)  # future positions -> -inf
         att = mx.softmax(att + mask, axis=-1)
+        att = self.attn_dropout(att)
         y = att @ v  # (B, nh, T, head_size)
 
         y = y.transpose(0, 2, 1, 3).reshape(B, T, C)  # reassemble heads
-        return self.c_proj(y)
+        return self.resid_dropout(self.c_proj(y))
 
 
 class MLP(nn.Module):
@@ -110,9 +120,10 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd)
         self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd)
+        self.dropout = nn.Dropout(cfg.dropout)
 
     def __call__(self, x):
-        return self.c_proj(nn.gelu(self.c_fc(x)))
+        return self.dropout(self.c_proj(nn.gelu(self.c_fc(x))))
 
 
 class SwiGLU(nn.Module):
@@ -126,9 +137,10 @@ class SwiGLU(nn.Module):
         self.w1 = nn.Linear(cfg.n_embd, hidden, bias=False)
         self.w3 = nn.Linear(cfg.n_embd, hidden, bias=False)
         self.w2 = nn.Linear(hidden, cfg.n_embd, bias=False)
+        self.dropout = nn.Dropout(cfg.dropout)
 
     def __call__(self, x):
-        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+        return self.dropout(self.w2(nn.silu(self.w1(x)) * self.w3(x)))
 
 
 def make_mlp(cfg):
@@ -159,6 +171,7 @@ class GPT(nn.Module):
         self.wte = nn.Embedding(vocab_size, cfg.n_embd)          # token embeddings
         if self.use_wpe:
             self.wpe = nn.Embedding(cfg.block_size, cfg.n_embd)  # position embeddings
+        self.drop = nn.Dropout(cfg.dropout)
         self.blocks = [Block(cfg) for _ in range(cfg.n_layer)]
         self.ln_f = make_norm(cfg, cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, vocab_size, bias=False)
@@ -168,6 +181,7 @@ class GPT(nn.Module):
         x = self.wte(idx)                            # (B, T, n_embd)
         if self.use_wpe:
             x = x + self.wpe(mx.arange(T))
+        x = self.drop(x)
         for block in self.blocks:
             x = block(x)
         return self.lm_head(self.ln_f(x))  # (B, T, vocab_size)
@@ -238,7 +252,7 @@ def plot_losses(history, out_dir):
 
 
 def write_report(out_dir, cfg, vocab_size, n_params, history, peak_gb,
-                 toks_per_s, elapsed, chars_per_tok, sample):
+                 toks_per_s, elapsed, chars_per_tok, sample, iters_done):
     """A nanochat-style report card: config + numbers + a sample."""
     best_val = min(h[2] for h in history)
     lines = [
@@ -248,8 +262,9 @@ def write_report(out_dir, cfg, vocab_size, n_params, history, peak_gb,
         f"(n_layer={cfg.n_layer}, n_head={cfg.n_head}, n_embd={cfg.n_embd})",
         f"- **tokenizer**: {cfg.tokenizer}, vocab={vocab_size} "
         f"({chars_per_tok:.2f} chars/token, block_size={cfg.block_size})",
-        f"- **training**: {cfg.max_iters:,} iters, batch={cfg.batch_size}, "
-        f"lr={cfg.learning_rate}, {elapsed/60:.1f} min",
+        f"- **training**: {iters_done:,} iters, batch={cfg.batch_size}, "
+        f"lr={cfg.learning_rate}, dropout={cfg.dropout}, wd={cfg.weight_decay}, "
+        f"{elapsed/60:.1f} min",
         f"- **hardware**: {peak_gb:.2f} GB peak, {toks_per_s:,.0f} tokens/s",
         f"- **loss**: final train {history[-1][1]:.4f} / val {history[-1][2]:.4f}, "
         f"best val {best_val:.4f}", "",
@@ -305,29 +320,47 @@ def main():
     def eval_loss(split, batches=20):
         return mx.mean(mx.array([loss_fn(model, *get_batch(split)) for _ in range(batches)])).item()
 
-    optimizer = optim.AdamW(learning_rate=cfg.learning_rate)
+    optimizer = optim.AdamW(learning_rate=cfg.learning_rate, weight_decay=cfg.weight_decay)
     loss_and_grad = nn.value_and_grad(model, loss_fn)
 
     history = []  # (iter, train_loss, val_loss) for the loss curve
+    best_val = float("inf")        # we checkpoint the best-val model, not the last
+    evals_since_improve = 0
     mx.reset_peak_memory()
     t0 = time.time()
+    it = 0
     for it in range(cfg.max_iters + 1):
         if it % cfg.eval_interval == 0:
+            model.eval()  # turn dropout off for a clean loss estimate
             tr, va = eval_loss("train"), eval_loss("val")
+            model.train()
             history.append((it, tr, va))
-            print(f"iter {it:5d} | train {tr:.4f} | val {va:.4f} | {time.time()-t0:.1f}s")
-            save_checkpoint(model, cfg, vocab_size, cfg.out_dir)  # crash-safe
+            improved = va < best_val
+            if improved:
+                best_val = va
+                evals_since_improve = 0
+                save_checkpoint(model, cfg, vocab_size, cfg.out_dir)  # keep the best
+            else:
+                evals_since_improve += 1
+            print(f"iter {it:5d} | train {tr:.4f} | val {va:.4f} | "
+                  f"{time.time()-t0:.1f}s{'  *best' if improved else ''}")
+            if cfg.early_stop_patience and evals_since_improve >= cfg.early_stop_patience:
+                print(f"early stop: no val improvement in {cfg.early_stop_patience} "
+                      f"evals (best val {best_val:.4f})")
+                break
         x, y = get_batch("train")
         loss, grads = loss_and_grad(model, x, y)
         optimizer.update(model, grads)
         mx.eval(model.parameters(), optimizer.state)
 
     elapsed = time.time() - t0
-    toks_per_s = cfg.max_iters * cfg.batch_size * cfg.block_size / elapsed
+    iters_done = it
+    toks_per_s = iters_done * cfg.batch_size * cfg.block_size / elapsed
     peak_gb = mx.get_peak_memory() / 1e9
-    save_checkpoint(model, cfg, vocab_size, cfg.out_dir)
+    # NB: the saved checkpoint is the best-val model, intentionally not this last one.
     print(f"peak memory: {peak_gb:.2f} GB  |  throughput: {toks_per_s:,.0f} tokens/s")
 
+    model.eval()  # sample without dropout
     print("\n--- sample ---")
     start = mx.array([encode("\n")])
     sample = decode(model.generate(start, max_new_tokens=300)[0].tolist())
@@ -335,7 +368,7 @@ def main():
 
     plot_losses(history, cfg.out_dir)
     write_report(cfg.out_dir, cfg, vocab_size, n_params, history, peak_gb,
-                 toks_per_s, elapsed, chars_per_tok, sample)
+                 toks_per_s, elapsed, chars_per_tok, sample, iters_done)
     print(f"\nwrote checkpoint, loss_curve.png and report_card.md to {cfg.out_dir}/")
 
 
