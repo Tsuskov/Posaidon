@@ -37,6 +37,11 @@ def get_args():
     p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4)
     p.add_argument("--n_embd", type=int, default=128)
+    # Phase 4 — modernize toward Llama (defaults reproduce the GPT-2-style baseline)
+    p.add_argument("--norm", choices=["layernorm", "rmsnorm"], default="layernorm")
+    p.add_argument("--pos", choices=["learned", "rope"], default="learned",
+                   help="learned position embeddings vs rotary (RoPE)")
+    p.add_argument("--mlp", choices=["gelu", "swiglu"], default="gelu")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--max_iters", type=int, default=2000)
     p.add_argument("--eval_interval", type=int, default=250)
@@ -48,18 +53,28 @@ def get_args():
 # ----------------------------------------------------------------------------
 # 1+2+3+4. The model
 # ----------------------------------------------------------------------------
+def make_norm(cfg, dims):
+    """LayerNorm (GPT-2) vs RMSNorm (Llama). RMSNorm drops the mean-centering
+    and the bias — it just rescales by the root-mean-square, which is cheaper
+    and works as well in practice."""
+    return nn.RMSNorm(dims) if cfg.norm == "rmsnorm" else nn.LayerNorm(dims)
+
+
 class CausalSelfAttention(nn.Module):
     """Multi-head self-attention where each token may only attend to itself
     and earlier tokens. The "causal" part is the upper-triangular mask of
     -inf added to the attention scores before softmax, so future positions
     get zero weight."""
 
-    def __init__(self, n_embd, n_head):
+    def __init__(self, cfg):
         super().__init__()
-        assert n_embd % n_head == 0
-        self.n_head = n_head
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd)  # query, key, value in one matmul
-        self.c_proj = nn.Linear(n_embd, n_embd)
+        assert cfg.n_embd % cfg.n_head == 0
+        self.n_head = cfg.n_head
+        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)  # q, k, v in one matmul
+        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
+        head_size = cfg.n_embd // cfg.n_head
+        # RoPE rotates q/k by position instead of adding a position embedding.
+        self.rope = nn.RoPE(head_size, base=10000) if cfg.pos == "rope" else None
 
     def __call__(self, x):
         B, T, C = x.shape
@@ -71,6 +86,9 @@ class CausalSelfAttention(nn.Module):
         k = k.reshape(B, T, self.n_head, hs).transpose(0, 2, 1, 3)
         v = v.reshape(B, T, self.n_head, hs).transpose(0, 2, 1, 3)
 
+        if self.rope is not None:  # position enters here, not at the embeddings
+            q, k = self.rope(q), self.rope(k)
+
         att = (q @ k.transpose(0, 1, 3, 2)) * (1.0 / math.sqrt(hs))  # (B, nh, T, T)
         mask = mx.triu(mx.full((T, T), -mx.inf), k=1)  # future positions -> -inf
         att = mx.softmax(att + mask, axis=-1)
@@ -81,26 +99,46 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    """Position-wise feed-forward: expand 4x, GELU, project back."""
+    """Position-wise feed-forward: expand 4x, GELU, project back (GPT-2 style)."""
 
-    def __init__(self, n_embd):
+    def __init__(self, cfg):
         super().__init__()
-        self.c_fc = nn.Linear(n_embd, 4 * n_embd)
-        self.c_proj = nn.Linear(4 * n_embd, n_embd)
+        self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd)
+        self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd)
 
     def __call__(self, x):
         return self.c_proj(nn.gelu(self.c_fc(x)))
 
 
+class SwiGLU(nn.Module):
+    """Gated feed-forward (Llama style): out = w2( silu(w1 x) * w3 x ).
+    Hidden width is 8/3*n_embd so the parameter count matches the GELU MLP,
+    making the loss comparison about the architecture, not the size."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        hidden = int(8 / 3 * cfg.n_embd)
+        self.w1 = nn.Linear(cfg.n_embd, hidden, bias=False)
+        self.w3 = nn.Linear(cfg.n_embd, hidden, bias=False)
+        self.w2 = nn.Linear(hidden, cfg.n_embd, bias=False)
+
+    def __call__(self, x):
+        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+
+
+def make_mlp(cfg):
+    return SwiGLU(cfg) if cfg.mlp == "swiglu" else MLP(cfg)
+
+
 class Block(nn.Module):
     """One transformer block: pre-norm attention + MLP, each with a residual."""
 
-    def __init__(self, n_embd, n_head):
+    def __init__(self, cfg):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head)
-        self.ln_2 = nn.LayerNorm(n_embd)
-        self.mlp = MLP(n_embd)
+        self.ln_1 = make_norm(cfg, cfg.n_embd)
+        self.attn = CausalSelfAttention(cfg)
+        self.ln_2 = make_norm(cfg, cfg.n_embd)
+        self.mlp = make_mlp(cfg)
 
     def __call__(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -112,16 +150,19 @@ class GPT(nn.Module):
     def __init__(self, vocab_size, cfg):
         super().__init__()
         self.block_size = cfg.block_size
+        self.use_wpe = cfg.pos == "learned"          # RoPE adds position inside attention
         self.wte = nn.Embedding(vocab_size, cfg.n_embd)          # token embeddings
-        self.wpe = nn.Embedding(cfg.block_size, cfg.n_embd)      # position embeddings
-        self.blocks = [Block(cfg.n_embd, cfg.n_head) for _ in range(cfg.n_layer)]
-        self.ln_f = nn.LayerNorm(cfg.n_embd)
+        if self.use_wpe:
+            self.wpe = nn.Embedding(cfg.block_size, cfg.n_embd)  # position embeddings
+        self.blocks = [Block(cfg) for _ in range(cfg.n_layer)]
+        self.ln_f = make_norm(cfg, cfg.n_embd)
         self.lm_head = nn.Linear(cfg.n_embd, vocab_size, bias=False)
 
     def __call__(self, idx):
         B, T = idx.shape
-        pos = mx.arange(T)
-        x = self.wte(idx) + self.wpe(pos)  # (B, T, n_embd)
+        x = self.wte(idx)                            # (B, T, n_embd)
+        if self.use_wpe:
+            x = x + self.wpe(mx.arange(T))
         for block in self.blocks:
             x = block(x)
         return self.lm_head(self.ln_f(x))  # (B, T, vocab_size)
@@ -194,7 +235,7 @@ def main():
     model = GPT(vocab_size, cfg)
     mx.eval(model.parameters())
     n_params = sum(p.size for _, p in nn.utils.tree_flatten(model.parameters()))
-    print(f"model params: {n_params/1e6:.2f}M")
+    print(f"arch: norm={cfg.norm} pos={cfg.pos} mlp={cfg.mlp}  |  params: {n_params/1e6:.2f}M")
 
     def loss_fn(model, x, y):
         logits = model(x)

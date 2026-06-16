@@ -19,6 +19,22 @@ By default it tokenizes per character. Pass `--tokenizer bpe` (needs `pip instal
 python minigpt_mlx.py --tokenizer bpe --vocab_size 2048
 ```
 
+### Architecture
+
+The defaults are a GPT-2-style baseline. Three flags modernize it toward Llama, and can be toggled one at a time to measure each effect:
+
+```bash
+python minigpt_mlx.py --norm rmsnorm --pos rope --mlp swiglu   # Llama-like
+```
+
+| Flag | baseline → modern | effect |
+| --- | --- | --- |
+| `--norm` | `layernorm` → `rmsnorm` | cheaper normalization (no mean/bias) |
+| `--pos` | `learned` → `rope` | rotary position encoding inside attention |
+| `--mlp` | `gelu` → `swiglu` | gated feed-forward (hidden width kept param-matched) |
+
+### Dataset
+
 The corpus gives Posaidon its voice: `build_kafka_corpus.py` assembles German Kafka works (Der Prozess, Die Verwandlung, …) from Project Gutenberg. Swap in any `input.txt` to retrain on a different style. For the original toy run, use tinyshakespeare instead:
 
 ```bash
