@@ -7,7 +7,7 @@ Posaidon is a small GPT language model built from scratch in [MLX](https://githu
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install mlx
-python build_kafka_corpus.py   # downloads public-domain Kafka into input.txt
+python build_greek_corpus.py   # downloads public-domain Greek myth into input.txt
 python minigpt_mlx.py
 ```
 
@@ -31,16 +31,16 @@ The defaults are a Llama-like stack (RMSNorm + RoPE + SwiGLU). Each piece can be
 
 ### Scaled training
 
-The Kafka corpus is tiny (~263K BPE tokens), so a big model just memorizes it: a
-27M-param run drives train loss to ~0 while val loss *climbs* to ~8. A ~4M-param
-model with light regularization generalizes better (best val 4.42 vs 4.54/4.79),
-trains in ~7 min, and actually *generates* text instead of reciting it:
+The Greek-myth corpus is ~1.58M BPE tokens — big enough to train a ~15.7M-param
+model that generalizes rather than memorizes. It early-stops at best val 3.97
+(around iter 1,500); train loss keeps falling afterwards as it starts to overfit,
+but the saved checkpoint is always the best-val one:
 
 ```bash
 python minigpt_mlx.py --tokenizer bpe --vocab_size 2048 \
-  --n_layer 4 --n_head 4 --n_embd 256 --block_size 256 --batch_size 32 \
+  --n_layer 8 --n_head 8 --n_embd 384 --block_size 256 --batch_size 32 \
   --max_iters 10000 --eval_interval 250 \
-  --dropout 0.2 --weight_decay 0.1 --early_stop_patience 10 --no_attn_bias
+  --dropout 0.1 --weight_decay 0.1 --early_stop_patience 10 --no_attn_bias
 ```
 
 `--dropout`/`--weight_decay` fight overfitting; `--early_stop_patience N` stops once
@@ -55,8 +55,7 @@ and tokenizer are read from `<out_dir>/config.json`, so you don't repeat the mod
 flags — just point at the directory and give a prompt:
 
 ```bash
-python minigpt_mlx.py --generate --prompt "K. saß " --max_new_tokens 200
-python minigpt_mlx.py --generate --out_dir out_27m_reg --prompt "Der Prozess "
+python minigpt_mlx.py --generate --prompt "Zeus " --max_new_tokens 200
 ```
 
 Generated text goes to stdout (the load info line to stderr), so it pipes cleanly.
@@ -77,7 +76,7 @@ which is what the scaled-training recipe above produces with `--no_attn_bias`:
 
 ```bash
 python export_gguf.py --gguf posaidon.gguf
-ollama create posaidon -f Modelfile && ollama run posaidon "K. "
+ollama create posaidon -f Modelfile && ollama run posaidon "Zeus "
 ```
 
 The exporter permutes the q/k weights from MLX's RoPE layout to GGUF's, so greedy
@@ -88,7 +87,7 @@ Writes a checkpoint (`model.safetensors` + `config.json` + `tokenizer.json`), a 
 
 ### Dataset
 
-The corpus gives Posaidon its voice: `build_kafka_corpus.py` assembles German Kafka works (Der Prozess, Die Verwandlung, …) from Project Gutenberg. Swap in any `input.txt` to retrain on a different style. For the original toy run, use tinyshakespeare instead:
+The corpus gives Posaidon its voice: `build_greek_corpus.py` assembles public-domain English retellings and translations of Greek myth and the Homeric epics (Bulfinch, Homer's *Iliad*/*Odyssey*, Hesiod, …) from Project Gutenberg. Swap in any `input.txt` to retrain on a different style. For the original toy run, use tinyshakespeare instead:
 
 ```bash
 curl -L https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt -o input.txt
