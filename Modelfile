@@ -1,0 +1,5 @@
+FROM ./posaidon.gguf
+# Base completion model (no chat template): emit the prompt verbatim and continue.
+TEMPLATE "{{ .Prompt }}"
+PARAMETER temperature 0
+PARAMETER num_predict 40

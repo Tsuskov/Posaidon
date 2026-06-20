@@ -31,13 +31,58 @@ The defaults are a Llama-like stack (RMSNorm + RoPE + SwiGLU). Each piece can be
 
 ### Scaled training
 
-A ~27M-param run on the Kafka corpus (safe on 16GB; ~4GB peak):
+The Kafka corpus is tiny (~263K BPE tokens), so a big model just memorizes it: a
+27M-param run drives train loss to ~0 while val loss *climbs* to ~8. A ~4M-param
+model with light regularization generalizes better (best val 4.42 vs 4.54/4.79),
+trains in ~7 min, and actually *generates* text instead of reciting it:
 
 ```bash
 python minigpt_mlx.py --tokenizer bpe --vocab_size 2048 \
-  --n_layer 8 --n_head 8 --n_embd 512 --block_size 256 --batch_size 32 \
-  --max_iters 10000 --eval_interval 250
+  --n_layer 4 --n_head 4 --n_embd 256 --block_size 256 --batch_size 32 \
+  --max_iters 10000 --eval_interval 250 \
+  --dropout 0.2 --weight_decay 0.1 --early_stop_patience 10 --no_attn_bias
 ```
+
+`--dropout`/`--weight_decay` fight overfitting; `--early_stop_patience N` stops once
+val loss hasn't improved for N evals. The checkpoint saved is always the best-val
+one, not the last. `--no_attn_bias` drops the attention biases (Llama-exact, no
+measurable loss cost) so the result exports cleanly to GGUF — see below.
+
+### Generate from a checkpoint
+
+`--generate` skips training and samples from a saved checkpoint. The architecture
+and tokenizer are read from `<out_dir>/config.json`, so you don't repeat the model
+flags — just point at the directory and give a prompt:
+
+```bash
+python minigpt_mlx.py --generate --prompt "K. saß " --max_new_tokens 200
+python minigpt_mlx.py --generate --out_dir out_27m_reg --prompt "Der Prozess "
+```
+
+Generated text goes to stdout (the load info line to stderr), so it pipes cleanly.
+
+### Publish: Hugging Face + Ollama
+
+`publish_hf.py` stages the checkpoint into a Hugging Face repo layout (weights +
+config + tokenizer + `MODEL_CARD.md` as the README + the loader) and can push it:
+
+```bash
+python publish_hf.py                              # stage into hf_repo/
+python publish_hf.py --push --repo you/Posaidon   # needs `huggingface-cli login`
+```
+
+For [Ollama](https://ollama.com), `export_gguf.py` converts the checkpoint to GGUF.
+It requires a **biasless** model (llama.cpp's `llama` arch has no attention bias),
+which is what the scaled-training recipe above produces with `--no_attn_bias`:
+
+```bash
+python export_gguf.py --gguf posaidon.gguf
+ollama create posaidon -f Modelfile && ollama run posaidon "K. "
+```
+
+The exporter permutes the q/k weights from MLX's RoPE layout to GGUF's, so greedy
+(`temperature 0`) output is token-identical to `--generate` until floating-point
+drift between the two engines diverges it.
 
 Writes a checkpoint (`model.safetensors` + `config.json` + `tokenizer.json`), a `loss_curve.png`, and a `report_card.md` to `--out_dir` (default `out/`).
 

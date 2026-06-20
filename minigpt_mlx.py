@@ -18,6 +18,7 @@ import argparse
 import json
 import math
 import os
+import sys
 import time
 
 import mlx.core as mx
@@ -45,6 +46,9 @@ def get_args():
     p.add_argument("--pos", choices=["learned", "rope"], default="rope",
                    help="learned position embeddings vs rotary (RoPE)")
     p.add_argument("--mlp", choices=["gelu", "swiglu"], default="swiglu")
+    p.add_argument("--no_attn_bias", action="store_true",
+                   help="drop bias on the attention q/k/v/o projections (Llama-style; "
+                        "needed for a clean GGUF/llama.cpp export)")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--max_iters", type=int, default=2000)
     p.add_argument("--eval_interval", type=int, default=250)
@@ -59,6 +63,13 @@ def get_args():
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--out_dir", default="out",
                    help="where to write checkpoints, loss curve and report card")
+    # Inference (Phase 6) — load a saved checkpoint and sample, no training. The
+    # architecture/tokenizer come from out_dir/config.json, so only these matter.
+    p.add_argument("--generate", action="store_true",
+                   help="skip training; load --out_dir checkpoint and sample from --prompt")
+    p.add_argument("--prompt", default="\n", help="seed text for --generate")
+    p.add_argument("--max_new_tokens", type=int, default=300,
+                   help="number of tokens to generate in --generate mode")
     return p.parse_args()
 
 
@@ -82,8 +93,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
         self.n_head = cfg.n_head
-        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)  # q, k, v in one matmul
-        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
+        bias = not getattr(cfg, "no_attn_bias", False)  # Llama drops these; needed for GGUF
+        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=bias)  # q, k, v in one matmul
+        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=bias)
         self.attn_dropout = nn.Dropout(cfg.dropout)    # on the softmax weights
         self.resid_dropout = nn.Dropout(cfg.dropout)   # on the residual output
         head_size = cfg.n_embd // cfg.n_head
@@ -276,11 +288,45 @@ def write_report(out_dir, cfg, vocab_size, n_params, history, peak_gb,
 
 
 # ----------------------------------------------------------------------------
+# Phase 6 — inference: load a checkpoint and sample, no training.
+# ----------------------------------------------------------------------------
+def run_generate(cfg):
+    """Rebuild the model from out_dir/config.json (so it always matches the saved
+    weights), load the tokenizer, and print a sample seeded by --prompt. Generated
+    text goes to stdout; the info line to stderr so output pipes cleanly."""
+    with open(os.path.join(cfg.out_dir, "config.json")) as f:
+        ckpt = argparse.Namespace(**json.load(f))      # the training-time config
+    vocab_size = ckpt.vocab_size
+
+    model = GPT(vocab_size, ckpt)
+    model.load_weights(os.path.join(cfg.out_dir, "model.safetensors"))  # raises on mismatch
+    model.eval()                                       # dropout off
+    n_params = sum(p.size for _, p in nn.utils.tree_flatten(model.parameters()))
+    print(f"loaded {cfg.out_dir}: {n_params/1e6:.2f}M params, vocab={vocab_size}, "
+          f"arch={ckpt.norm}/{ckpt.pos}/{ckpt.mlp}", file=sys.stderr)
+
+    if ckpt.tokenizer == "bpe":
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(os.path.join(cfg.out_dir, "tokenizer.json"))
+        encode, decode = (lambda s: tok.encode(s).ids), (lambda ids: tok.decode(ids))
+    else:  # char tokenizer isn't saved — rebuild it deterministically from the data
+        with open(ckpt.data, "r", encoding="utf-8") as f:
+            encode, decode, _ = build_tokenizer(f.read(), "char", 0)
+
+    ids = mx.array([encode(cfg.prompt)])
+    out = model.generate(ids, cfg.max_new_tokens)[0].tolist()
+    print(decode(out))
+
+
+# ----------------------------------------------------------------------------
 # 5. Data + training loop
 # ----------------------------------------------------------------------------
 def main():
     cfg = get_args()
     mx.random.seed(cfg.seed)
+    if cfg.generate:
+        run_generate(cfg)
+        return
     os.makedirs(cfg.out_dir, exist_ok=True)
 
     with open(cfg.data, "r", encoding="utf-8") as f:
