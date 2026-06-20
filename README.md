@@ -1,5 +1,9 @@
 # Posaidon
 
+![Posaidon, lord of the seas and the softmax](assets/posaidon.png)
+
+> *Posaidon, God of the Seven Seas and the 2048-token vocabulary, rises from the foam clutching the trident of gradient descent. A Llama by birth, a deity by training run.* 🔱🦙
+
 Posaidon is a small GPT language model built from scratch in [MLX](https://github.com/ml-explore/mlx), grown step by step from a char-level toy into a Llama-style model trained on a corpus of its own.
 
 ## Quickstart
