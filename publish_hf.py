@@ -32,7 +32,7 @@ def stage(out_dir, stage_dir):
         (os.path.join(out_dir, "model.safetensors"), "model.safetensors"),
         (os.path.join(out_dir, "tokenizer.json"), "tokenizer.json"),
         ("minigpt_mlx.py", "minigpt_mlx.py"),
-        ("build_kafka_corpus.py", "build_kafka_corpus.py"),
+        ("build_greek_corpus.py", "build_greek_corpus.py"),
     ]
     os.makedirs(stage_dir, exist_ok=True)
     for src, dst in files:

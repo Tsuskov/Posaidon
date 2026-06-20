@@ -1,5 +1,5 @@
 ---
-language: de
+language: en
 license: mit
 library_name: mlx
 pipeline_tag: text-generation
@@ -7,24 +7,24 @@ tags:
   - text-generation
   - mlx
   - nanogpt
-  - german
-  - kafka
+  - greek-mythology
 ---
 
 # Posaidon
 
-Posaidon is a small (~4.2M-parameter) GPT language model **built from scratch in
+Posaidon is a small (~15.7M-parameter) GPT language model **built from scratch in
 [Apple MLX](https://github.com/ml-explore/mlx)**, trained on a corpus of
-public-domain German Franz Kafka texts. It is a learning project — a nanoGPT-style
-transformer grown step by step into a Llama-style stack — not a general-purpose
-assistant. It writes early-20th-century German prose in Kafka's bureaucratic,
-unsettling register.
+public-domain English retellings and prose translations of Greek mythology and the
+Homeric epics. It is a learning project — a nanoGPT-style transformer grown step by
+step into a Llama-style stack — not a general-purpose assistant. The name fits the
+data: Posaidon (Poseidon) trained on the sea-god's own myths. It writes
+19th/early-20th-century English myth-prose in the register of its sources.
 
 ## Intended use
 
 Educational and creative: studying a transformer end-to-end, and generating
-Kafka-flavoured German text. It is **not** instruction-tuned, multilingual, or
-factual, and should not be used for anything that needs correctness.
+myth-flavoured English text. It is **not** instruction-tuned, factual, or safe for
+anything that needs correctness.
 
 ## How to use
 
@@ -36,7 +36,7 @@ git clone https://github.com/Tsuskov/Posaidon && cd Posaidon
 python3 -m venv .venv && source .venv/bin/activate
 pip install mlx tokenizers
 # place the checkpoint files in out/  (model.safetensors, config.json, tokenizer.json)
-python minigpt_mlx.py --generate --prompt "K. saß " --max_new_tokens 200
+python minigpt_mlx.py --generate --prompt "Zeus " --max_new_tokens 200
 ```
 
 Architecture and tokenizer are read from `out/config.json`, so no model flags are
@@ -46,7 +46,7 @@ It also runs under [Ollama](https://ollama.com) via the included GGUF export:
 
 ```bash
 python export_gguf.py --gguf posaidon.gguf
-ollama create posaidon -f Modelfile && ollama run posaidon "K. "
+ollama create posaidon -f Modelfile && ollama run posaidon "Zeus "
 ```
 
 ## Architecture
@@ -55,21 +55,22 @@ Llama-like decoder-only transformer:
 
 | | |
 | --- | --- |
-| parameters | 4.2M |
-| layers / heads / d_model | 4 / 4 / 256 |
+| parameters | 15.74M |
+| layers / heads / d_model | 8 / 8 / 384 |
 | normalization | RMSNorm (pre-norm) |
 | positional encoding | RoPE (base 10000) |
 | feed-forward | SwiGLU (hidden = 8/3·d_model) |
 | attention bias | none (Llama-exact, so it exports cleanly to GGUF) |
 | context length | 256 tokens |
-| tokenizer | byte-level BPE, vocab 2048 (~3.38 chars/token) |
+| tokenizer | byte-level BPE, vocab 2048 (~3.12 chars/token) |
 
 ## Training data
 
-A ~887K-character corpus assembled by `build_kafka_corpus.py` from Project Gutenberg
-(public domain): *Der Prozess, Die Verwandlung, Ein Landarzt, Das Urteil, In der
-Strafkolonie, Ein Hungerkünstler, Betrachtung, Der Heizer*. A 90/10 train/val split
-gives ~237K training tokens.
+A ~4.93M-character corpus assembled by `build_greek_corpus.py` from Project Gutenberg
+(public domain): Bulfinch's *The Age of Fable*; Berens' *Myths and Legends of Greece
+and Rome*; Kingsley's *The Heroes*; Hawthorne's *Tanglewood Tales*; Homer's *Iliad*
+(Butler) and *Odyssey* (Butler, and Butcher & Lang); and *Hesiod, the Homeric Hymns,
+and Homerica*. A 90/10 train/val split gives ~1.42M training tokens (1.58M total).
 
 ## Training procedure
 
@@ -77,40 +78,39 @@ gives ~237K training tokens.
 | --- | --- |
 | hardware | Apple Silicon (16GB), MLX |
 | optimizer | AdamW, lr 3e-4, weight decay 0.1 |
-| regularization | dropout 0.2, early stopping (patience 10) |
-| batch / steps | batch 32 × 256 tokens, early-stopped at 3,250 iters (~7 min) |
+| regularization | dropout 0.1, early stopping (patience 10) |
+| batch / steps | batch 32 × 256 tokens, early-stopped at 4,000 iters (best at 1,500) |
+| throughput | 17,499 tokens/s, peak memory 5.25 GB |
 | checkpoint | best validation loss, not last step |
 
 ## Evaluation
 
 Cross-entropy on the held-out 10% split (BPE tokens; not comparable to char-level
-loss): **best val loss 4.42**.
+loss): **best val loss 3.97**.
 
-The corpus is tiny (~237K tokens), so model size matters more than usual. A 27M-param
-model drove training loss to ~0 while **validation loss climbed to ~8** — it memorized
-the corpus and recited it verbatim. This 4.2M model, with dropout + weight decay +
-early stopping, reaches a **lower** val loss (4.42 vs 4.54/4.79), keeps a much smaller
-train/val gap, and actually *generates* rather than reciting. The trade-off is that
-its samples read rougher — see Limitations.
+Validation bottomed out at iter 1,500 and then rose while training loss kept falling
+(to ~1.77 by iter 4,000) — the model begins to overfit the corpus, and early stopping
+keeps the best-val checkpoint rather than the last step.
 
 ## Limitations and biases
 
-- **Tiny and narrow.** Trained only on early-1900s German literary prose; it knows
-  nothing else and is not factual.
-- **Invents words.** Because it generalizes rather than memorizes, it produces
-  plausible-looking but non-existent German words ("Rausengrat", "Schwerkehrer") and
-  loses grammatical coherence over long spans.
+- **Small and narrow.** Trained only on 19th/early-20th-century English myth-prose; it
+  knows nothing else and is not factual.
+- **Invents and conflates.** It produces fluent-looking sentences that mangle names and
+  facts (mixing up gods, epics, and titles) and loses coherence over long spans.
 - **No safety tuning.** No alignment, instruction-following, or content filtering.
 - **Reflects its source.** Vocabulary, gender roles, and worldview are those of its
-  early-20th-century source texts.
+  19th/early-20th-century source texts.
 
 ## Sample
 
 Prompt `"\n"`:
 
-> Während seien. Dann hätte man ihn K. schon während des Dieners nichts auffallend
-> sein Schreien. […] Der plötzliche war eine gewisse Unterbrechung des Zuspruches
-> begreifens und mit Zach Farbe bedeckte er mit der Tasse ein wenig aufgefunden.
+> called the Trojans in order, and declared heartily to prosper with some purpose.
+> Pentheus and Uranus and Gaea were renowned for their great fruit, that Cronion had
+> putting home like Artemis to enter homage. […] the “Odyssey” was a goddess bestowed
+> with the honour of the Argonauts as the _Iliad_ and “Odyssey” to this description is
+> describing the _Works and Days_, by Dodona and CAICTOLIA.
 
 ## Attribution
 
