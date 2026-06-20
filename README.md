@@ -1,5 +1,17 @@
 # Posaidon
 
+<p align="center">
+  <img src="https://img.shields.io/badge/built%20from-scratch-0a7e8c" alt="Built from scratch">
+  <img src="https://img.shields.io/badge/MLX-Apple%20Silicon-000000?logo=apple&logoColor=white" alt="MLX">
+  <img src="https://img.shields.io/badge/Python-3.x-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/arch-Llama--style-1f6feb" alt="Llama-style architecture">
+  <img src="https://img.shields.io/badge/params-15.7M-7b3fe4" alt="15.7M params">
+  <img src="https://img.shields.io/badge/tokenizer-BPE%202048-d4a017" alt="BPE 2048">
+  <img src="https://img.shields.io/badge/export-GGUF%20%2F%20Ollama-ff6f00" alt="GGUF / Ollama export">
+  <img src="https://img.shields.io/badge/corpus-Greek%20myth-c2410c" alt="Greek myth corpus">
+  <img src="https://img.shields.io/badge/%F0%9F%94%B1%F0%9F%A6%99-lord%20of%20the%20softmax-0a7e8c" alt="Lord of the softmax">
+</p>
+
 ![Posaidon, lord of the seas and the softmax](assets/posaidon.png)
 
 > *Posaidon, God of the Seven Seas and the 2048-token vocabulary, rises from the foam clutching the trident of gradient descent. A Llama by birth, a deity by training run.* 🔱🦙
